@@ -609,30 +609,6 @@
     },
     {
       "group": "strip_background_noise",
-      "name": "bthserv",
-      "start": 4,
-      "note": "Bluetooth Support Service"
-    },
-    {
-      "group": "strip_background_noise",
-      "name": "BTAGService",
-      "start": 4,
-      "note": "Bluetooth Audio Gateway"
-    },
-    {
-      "group": "strip_background_noise",
-      "name": "BluetoothUserService",
-      "start": 4,
-      "note": "Bluetooth User Support"
-    },
-    {
-      "group": "strip_background_noise",
-      "name": "BthAvctpSvc",
-      "start": 4,
-      "note": "Bluetooth AVCTP"
-    },
-    {
-      "group": "strip_background_noise",
       "name": "Dosvc",
       "start": 4,
       "note": "Delivery Optimization"
