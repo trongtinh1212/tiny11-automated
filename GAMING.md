@@ -75,7 +75,7 @@ Group names match the workflow input names exactly.
 | Group | What it does |
 |---|---|
 | `atlas_power_scheme` | Creates and activates a new power scheme (see [below](#the-power-scheme)), disables hibernation and power throttling, keeps the storage link out of low-power states, and sets MMCSS `SystemResponsiveness` to 10 |
-| `disable_cpu_idle` | Forces the CPU to stay in C-State 0 — no idle states, so there is no C-State wake penalty on a frame spike. Also sets the energy-performance preference to 0 and the boost policy to 100, which is the hint HWP/CPPC parts actually act on |
+| `disable_cpu_idle` | **Off by default.** Forces the CPU to stay in C-State 0 — no idle states, so there is no C-State wake penalty on a frame spike. Costs idle power, and on a lot of platforms it stops the processor power engine offering turbo, so the CPU parks at its highest non-boost P-state (a 3.6 GHz part then reads a constant 3.4 GHz). Enable it only if you have measured a wake-latency win on your own hardware |
 
 ### Security (the aggressive part)
 
@@ -345,20 +345,73 @@ So `config/gaming_power_settings.json` now:
 
 ### Where this profile deliberately diverges from Atlas
 
-Atlas leaves **CPU idle enabled**. This profile disables it, forcing C-State 0 and
-removing the C-State wake penalty — the most useful single latency tweak for a CPU-bound
-esport. It is gated behind its own `disable_cpu_idle` toggle (on by default) and labelled
-as a divergence in the profile JSON, so turning that toggle off gives you an exact Atlas
-match.
+Atlas leaves **CPU idle enabled**. This profile *can* disable it, forcing C-State 0 and
+removing the C-State wake penalty — but that toggle, `disable_cpu_idle`, is **off by
+default**, because it is not free:
 
-Three further CPU settings — boost mode (Aggressive), performance time-check interval
-(15) and core parking (disabled) — are written explicitly too. On the Ultimate
-Performance base they are redundant, but they guarantee the same behaviour if the base
-template ever falls back to High performance.
+- With C-states disabled the processor power engine stops offering turbo on a lot of
+  platforms. The CPU then parks at its highest non-boost P-state, so a 3.6 GHz part
+  reports a constant 3.4 GHz. Nothing errors and nothing logs a warning — the machine
+  just runs below its rating, which is why the default is now off.
+- It also raises idle power and temperatures. AtlasOS itself warns against it on laptops
+  or poorly-cooled machines.
 
-> **Power cost.** C-State 0 means higher idle power and higher temperatures. AtlasOS
-> itself warns against this on laptops or poorly-cooled machines. Fine on a desktop
-> gaming rig; think twice on a laptop.
+Turn it on only if you have measured a wake-latency win on your own hardware. With it
+off, the scheme is an exact Atlas match.
+
+Three further CPU settings are written **unconditionally**, because they can only widen
+the clock ceiling and never narrow it: energy-performance preference (0 = max
+performance), boost policy (100 = do not trim boost for efficiency), and boost mode
+(Enabled). They are deliberately *not* part of `disable_cpu_idle` — gating them behind it
+was how a build could end up with both a capped clock and no idle states. Core parking
+(disabled) and the 15 ms performance time-check interval are written as well; on the
+Ultimate Performance base they are redundant, but they guarantee the same behaviour if the
+base template ever falls back to High performance.
+
+> **Power cost.** C-State 0 means higher idle power and higher temperatures. Fine on a
+> desktop gaming rig; think twice on a laptop.
+
+### Getting a constant max clock
+
+C-State 0 is **not** the lever for a high, steady clock — it is the thing that was
+holding it down. If you want a 3.6 GHz part to read 3.6 GHz instead of 3.4 GHz, leave
+`disable_cpu_idle` off and work down this list:
+
+| # | Lever | Wanted | Where it comes from |
+|---|---|---|---|
+| 1 | Minimum processor state (AC) | `100` | written by this scheme — **this is the one that pins the clock** |
+| 2 | Maximum processor state (AC) | `100` | written |
+| 3 | Processor performance boost mode | `1` (Enabled) | written |
+| 4 | Processor performance boost policy | `100` | written |
+| 5 | Energy-performance preference | `0` | written |
+| 6 | Core parking min cores | `100` | written |
+| 7 | Processor idle disable | `0` — idle **enabled** | default; do not turn it on |
+| 8 | `disabledynamictick` / `useplatformtick` in BCD | **absent** | deleted by the builder |
+| 9 | BIOS Turbo Boost / Core Performance Boost | enabled | firmware — not Windows |
+| 10 | Power and thermal limits (PL1/PL2, PROCHOT) | not throttling | firmware — not Windows |
+
+Items 1–8 are all handled by the build, and `gaming-firstboot.ps1` now reads 1–4 back out
+of the activated scheme and logs a `MISMATCH` line if any of them did not stick. If the
+clock is still capped after a clean install, the cause is 9 or 10, and nothing in Windows
+can override those.
+
+Verify on a live install rather than trusting the log:
+
+```powershell
+powercfg /getactivescheme
+powercfg /q SCHEME_CURRENT SUB_PROCESSOR
+```
+
+`Current AC Power Setting Index` must read `0x00000064` for both `893dee8e…` (minimum
+state) and `bc5038f7…` (maximum state). Then watch **HWiNFO64 → Core Clocks** under load:
+if the clock never exceeds base while *Turbo Boost* reports as supported, the firmware is
+refusing turbo, not Windows.
+
+> **"Always" has a limit.** Turbo is opportunistic by design. Windows can remove the
+> brakes, but it cannot promise a *sustained* clock — an all-core load on a power-limited
+> part will drop below the single-core turbo figure no matter what the power scheme says.
+> The scheme guarantees the clock never falls below base and that boost is available; the
+> rest is the CPU's power budget and your cooler.
 
 The scheme is exported to `C:\Windows\Tiny11Gaming\Atlas-Power-Scheme.pow` so you can
 move it to another machine.
@@ -400,8 +453,10 @@ Being explicit about the rejected tweaks is more useful than the list above.
   builder, so older images get corrected.
 - **`useplatformclock true` is not used.** Same class of myth, larger effect. The
   invariant TSC is the correct clock on every CPU this profile targets.
-- **`disabledynamictick yes` is kept, but only under `disable_cpu_idle`.** It stops the
-  timer going tickless while idle. Mild consistency gain, real idle-power cost.
+- **`disabledynamictick yes` is not used, and is deleted if an older image left it.** It
+  stops the timer going tickless while idle. On a lot of platforms that also stops the
+  processor power engine offering turbo — the CPU parks at its highest non-boost P-state —
+  and it raises idle power. The latency it buys does not pay for a capped clock.
 - **No standby-list "cleaners".** Emptying the standby list on a timer throws away the
   file cache and causes the stutter it claims to fix.
 - **No per-vendor GPU registry edits.** Power-management mode belongs in the driver
@@ -598,8 +653,8 @@ offline hives the builder loads (`HKLM\zSYSTEM`, `zSOFTWARE`, `zDEFAULT`, `zNTUS
 This matters more than the tweak list.
 
 - **Frame-time consistency improves more than average FPS.** The latency tweaks
-  (C-State 0, no core parking, mitigations off, MPO off, MSI mode) mostly show up in 1%
-  lows and input latency, not in a big average-FPS number.
+  (no core parking, boost policy, mitigations off, MPO off, MSI mode) mostly show up in
+  1% lows and input latency, not in a big average-FPS number.
 - **Disabling VBS/HVCI is the largest single lever**, typically quoted at 5–15% on
   affected titles. It is also the biggest security cost.
 - **The device layer is worth more on some machines than others.** MSI mode and
@@ -616,8 +671,9 @@ This matters more than the tweak list.
 
 ## Rainbow Six Siege notes
 
-- R6 Siege is **CPU-bound**, so `disable_cpu_idle`, the 100% min processor state,
-  mitigations off and MPO off are the changes that matter most here.
+- R6 Siege is **CPU-bound**, so the 100% min processor state, boost policy,
+  mitigations off and MPO off are the changes that matter most here. `disable_cpu_idle`
+  is *not* on that list — it is off by default and it lowers the clock on most parts.
 - **BattlEye is unaffected** by anything in this profile. It does not object to VBS
   being off, to Xbox services being removed, or to the network tweaks.
 - **Disable fullscreen optimizations** (`disable_fso`, on by default here) is what most

@@ -160,6 +160,57 @@ function New-GamingPowerScheme {
     return $schemeGuid
 }
 
+function Test-GamingPowerScheme {
+    # Reads the effective values back out of the activated scheme and reports them.
+    #
+    # The apply loop above counts a setting as applied when either the AC or the DC
+    # write returned 0, which is enough to know powercfg accepted the call but not
+    # enough to know the platform honoured it. A silently unapplied value is exactly
+    # how a CPU ends up pinned below its rated frequency with no visible error, so
+    # the four values that set the clock floor and ceiling are asserted, not assumed.
+    #
+    # The floor matters as much as the ceiling: a scheme with maximum state 100 but
+    # minimum state 5 passes every ceiling check while idling at its lowest P-state,
+    # which reads as "the CPU is not reaching its rated clock". Minimum processor
+    # state is the value that actually holds a 3.6 GHz part at 3.6 GHz, and it was
+    # the one thing this function did not look at.
+    param([string]$SchemeGuid)
+
+    if (-not $SchemeGuid) { return }
+
+    $query = & powercfg -query $SchemeGuid 2>&1 | Out-String
+    if (-not $query) {
+        Write-Log "  could not read the scheme back - clock verification skipped" 'WARN'
+        return
+    }
+
+    $checks = @(
+        @{ Name = 'Minimum processor state';           Guid = '893dee8e-2bef-41e0-89c6-b55d0929964c'; Expected = 100 },
+        @{ Name = 'Maximum processor state';           Guid = 'bc5038f7-23e0-4960-96da-33abaf5935ec'; Expected = 100 },
+        @{ Name = 'Processor performance boost mode';  Guid = 'be337238-0d82-4146-a960-4f3749d470c7'; Expected = 1   },
+        @{ Name = 'Processor performance boost policy';Guid = '45bcc044-d885-43e2-8605-ee0ec6e96b59'; Expected = 100 }
+    )
+
+    foreach ($check in $checks) {
+        # powercfg prints the setting GUID in the header line, then the effective
+        # values a few lines below it.
+        $pattern = [regex]::Escape($check.Guid) + '[\s\S]{0,800}?Current AC Power Setting Index:\s*0x([0-9a-fA-F]+)'
+        $match = [regex]::Match($query, $pattern)
+        if (-not $match.Success) {
+            Write-Log "  $($check.Name): not exposed on this platform (skipped)" 'WARN'
+            continue
+        }
+
+        $actual = [Convert]::ToInt32($match.Groups[1].Value, 16)
+        if ($actual -eq $check.Expected) {
+            Write-Log "  verified: $($check.Name) = $actual"
+        } else {
+            Write-Log "  MISMATCH: $($check.Name) = $actual, expected $($check.Expected) - the CPU will not reach its rated clock" 'WARN'
+            $script:Failures++
+        }
+    }
+}
+
 #---------[ BCD ]---------#
 
 function Set-GamingBootConfiguration {
@@ -597,15 +648,18 @@ try {
             }
             # Re-assert the active scheme; 'powercfg -h off' can reset it.
             & powercfg -setactive $schemeGuid 2>&1 | Out-Null
+            Test-GamingPowerScheme -SchemeGuid $schemeGuid
         }
     } else {
         Write-Log "Power scheme group disabled - skipping"
     }
 
-    if (Test-GroupEnabled 'disable_security_mitigations') {
-        Write-Section 'Boot configuration'
-        Set-GamingBootConfiguration -ConfigPath $powerConfig -Groups $groups
-    }
+    # Always run this. Each bcd entry carries its own group, and gating the whole
+    # function on disable_security_mitigations used to drop unrelated entries
+    # ('timeout 5', 'nx OptIn', the useplatformtick cleanup) whenever that one
+    # group was turned off.
+    Write-Section 'Boot configuration'
+    Set-GamingBootConfiguration -ConfigPath $powerConfig -Groups $groups
 
     if (Test-GroupEnabled 'network_latency_tweaks') {
         Write-Section 'Network latency'
